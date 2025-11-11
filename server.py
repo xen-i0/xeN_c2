@@ -10,6 +10,7 @@ import uuid
 import sqlite3
 import random
 import time
+from urllib.parse import unquote
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "server_config.db")
 HISTORY_FILE = os.path.expanduser("~/.hta_c2_history")
